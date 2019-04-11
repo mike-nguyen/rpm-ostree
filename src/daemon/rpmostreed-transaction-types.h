@@ -146,4 +146,3 @@ rpmostreed_transaction_new_kernel_arg (GDBusMethodInvocation *invocation,
                                        GVariant              *options,
                                        GCancellable          *cancellable,
                                        GError               **error);
-

@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include <gio/gunixfdlist.h>
+
 #include "libglnx.h"
 #include "rpmostree-rojig-core.h"
 #include "rpmostree-core.h"
@@ -68,6 +70,9 @@ struct _RpmOstreeContext {
   guint n_async_pkgs_imported;
   GPtrArray *pkgs_to_relabel;
   guint n_async_pkgs_relabeled;
+
+  GPtrArray *uris_to_download;
+  GUnixFDList *uri_fd_list;
 
   GHashTable *pkgs_to_remove;  /* pkgname --> gv_nevra */
   GHashTable *pkgs_to_replace; /* new gv_nevra --> old gv_nevra */

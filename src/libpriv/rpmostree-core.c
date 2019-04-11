@@ -21,6 +21,7 @@
 #include "config.h"
 
 #include <glib-unix.h>
+#include <gio/gunixfdlist.h>
 #include <rpm/rpmsq.h>
 #include <rpm/rpmlib.h>
 #include <rpm/rpmlog.h>
@@ -359,6 +360,10 @@ rpmostree_context_finalize (GObject *object)
   g_clear_pointer (&rctx->pkgs_to_download, g_ptr_array_unref);
   g_clear_pointer (&rctx->pkgs_to_import, g_ptr_array_unref);
   g_clear_pointer (&rctx->pkgs_to_relabel, g_ptr_array_unref);
+
+  //g_clear_pointer (&rctx->uris_to_download, g_ptr_array_unref);
+  g_clear_object (&rctx->uri_fd_list);
+  g_clear_pointer (&rctx->uris_to_download, g_ptr_array_unref);
 
   g_clear_pointer (&rctx->pkgs_to_remove, g_hash_table_unref);
   g_clear_pointer (&rctx->pkgs_to_replace, g_hash_table_unref);
@@ -1952,24 +1957,34 @@ rpmostree_context_prepare (RpmOstreeContext *self,
 
   /* And finally, handle repo packages to install */
   g_autoptr(GPtrArray) missing_pkgs = NULL;
+  self->uris_to_download = g_ptr_array_new(); //_with_free_func ((GDestroyNotify)g_free);
   for (char **it = pkgnames; it && *it; it++)
     {
       const char *pkgname = *it;
       g_autoptr(GError) local_error = NULL;
 
       g_assert (!self->rojig_pure);
-      if (!dnf_context_install (dnfctx, pkgname, &local_error))
+      if (g_str_has_prefix (*it, "http://") ||
+          g_str_has_prefix (*it, "https://"))
         {
-          /* Only keep going if it's ENOENT, so we coalesce into one msg at the end */
-          if (!g_error_matches (local_error, DNF_ERROR, DNF_ERROR_PACKAGE_NOT_FOUND))
+          /* Add to list of uris to download */
+          g_ptr_array_add(self->uris_to_download, (gpointer)pkgname);
+        }
+      else
+        {
+          if (!dnf_context_install (dnfctx, pkgname, &local_error))
             {
-              g_propagate_error (error, g_steal_pointer (&local_error));
-              return FALSE;
+              /* Only keep going if it's ENOENT, so we coalesce into one msg at the end */
+              if (!g_error_matches (local_error, DNF_ERROR, DNF_ERROR_PACKAGE_NOT_FOUND))
+                {
+                  g_propagate_error (error, g_steal_pointer (&local_error));
+                  return FALSE;
+                }
+              /* lazy init since it's unlikely in the common case (e.g. upgrades) */
+              if (!missing_pkgs)
+                missing_pkgs = g_ptr_array_new ();
+              g_ptr_array_add (missing_pkgs, (gpointer)pkgname);
             }
-          /* lazy init since it's unlikely in the common case (e.g. upgrades) */
-          if (!missing_pkgs)
-            missing_pkgs = g_ptr_array_new ();
-          g_ptr_array_add (missing_pkgs, (gpointer)pkgname);
         }
     }
 
@@ -2204,6 +2219,27 @@ rpmostree_context_download (RpmOstreeContext *self,
                             GError          **error)
 {
   int n = self->pkgs_to_download->len;
+  int u = self->uris_to_download->len;
+  self->uri_fd_list = g_unix_fd_list_new();
+
+  if (u > 0)
+    {
+      //g_autoptr(GUnixFDList) fd_list = g_unix_fd_list_new ();
+      //GUnixFDList* fd_list = g_unix_fd_list_new ();
+
+      for (gsize i = 0; i < self->uris_to_download->len; i++)
+        {
+          const gchar *uri = g_ptr_array_index (self->uris_to_download, i);
+          g_print("Downloading: %s\n", uri);
+          glnx_autofd int fd = ror_download_to_fd (uri, error);
+          if (fd < 0)
+            return FALSE;
+
+          gint idx = g_unix_fd_list_append (self->uri_fd_list, fd, error);
+          if (idx < 0)
+            return FALSE;
+        }
+    }
 
   if (n > 0)
     {
@@ -2392,11 +2428,14 @@ rpmostree_context_import_rojig (RpmOstreeContext *self,
 {
   DnfContext *dnfctx = self->dnfctx;
   const int n = self->pkgs_to_import->len;
-  if (n == 0)
-    return TRUE;
 
   OstreeRepo *repo = get_pkgcache_repo (self);
   g_return_val_if_fail (repo != NULL, FALSE);
+
+
+
+  if (n == 0)
+    return TRUE;
 
   if (!dnf_transaction_import_keys (dnf_context_get_transaction (dnfctx), error))
     return FALSE;
@@ -2405,6 +2444,28 @@ rpmostree_context_import_rojig (RpmOstreeContext *self,
   /* Note use of commit-on-failure */
   if (!rpmostree_repo_auto_transaction_start (&txn, repo, TRUE, cancellable, error))
     return FALSE;
+
+  for (gint i = 0; i < g_unix_fd_list_get_length (self->uri_fd_list); i++)
+    {
+      glnx_autofd int fd = g_unix_fd_list_get (self->uri_fd_list, i, error);
+      g_print ("importing package at fd %i\n", fd);
+      /* let's just use the current sepolicy -- we'll just relabel it if the new
+       * base turns out to have a different one */
+      glnx_autofd int rootfs_dfd = -1;
+      if (!glnx_opendirat (AT_FDCWD, "/", TRUE, &rootfs_dfd, error))
+        return FALSE;
+
+      g_autoptr(OstreeSePolicy) policy = ostree_sepolicy_new_at (rootfs_dfd, cancellable, error);
+      if (policy == NULL)
+        return FALSE;
+
+      g_autoptr(RpmOstreeImporter) unpacker = rpmostree_importer_new_take_fd (&fd, repo, NULL, 0, policy, error);
+      if (unpacker == NULL)
+        return FALSE;
+
+      if (!rpmostree_importer_run (unpacker, NULL, cancellable, error))
+        return FALSE;
+    }
 
   self->rojig_xattr_table = rojig_xattr_table;
   self->rojig_pkg_to_xattrs = rojig_pkg_to_xattrs;
@@ -3177,6 +3238,13 @@ relabel_if_necessary (RpmOstreeContext *self,
 
   rpmostree_output_progress_end (&progress);
 
+  // relabel downloaded packages that were installed
+  /*gboolean changed = FALSE;
+  if (!relabel_in_thread_impl (self, "cowsay", "3.04-11.fc29", "noarch", relabel_tmpdir.fd, &changed, cancellable, error))
+    {
+      g_print("failed to relabel cowsay");
+      return FALSE;
+    }*/
   /* Commit */
   if (!ostree_repo_commit_transaction (ostreerepo, NULL, cancellable, error))
     return FALSE;
@@ -3829,6 +3897,17 @@ rpmostree_context_assemble (RpmOstreeContext      *self,
   g_auto(RpmOstreeProgress) checkout_progress = { 0, };
   rpmostree_output_progress_nitems_begin (&checkout_progress, n_rpmts_elements, "%s", progress_msg);
 
+  /* Checkout downloaded packages to root */
+  if (self->uris_to_download)
+    {
+      if (!checkout_package_into_root (self, filesystem_package,
+                                       tmprootfs_dfd, ".", self->devino_cache,
+                                       g_hash_table_lookup (pkg_to_ostree_commit,
+                                                            filesystem_package), NULL,
+                                       OSTREE_REPO_CHECKOUT_OVERWRITE_UNION_IDENTICAL,
+                                       cancellable, error))
+        return FALSE;
+    }
   /* Okay so what's going on in Fedora with incestuous relationship
    * between the `filesystem`, `setup`, `libgcc` RPMs is actively
    * ridiculous.  If we unpack libgcc first it writes to /lib64 which
