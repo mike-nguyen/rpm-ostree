@@ -972,7 +972,6 @@ rpmostree_importer_run (RpmOstreeImporter *self,
     }
 
   const char *branch = rpmostree_importer_get_ostree_branch (self);
-  g_print("branch: %s\ncsum: %s\n", branch, csum);
   ostree_repo_transaction_set_ref (self->repo, NULL, branch, csum);
 
   if (out_csum)

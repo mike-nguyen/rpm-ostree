@@ -20,8 +20,6 @@
 
 #pragma once
 
-#include <gio/gunixfdlist.h>
-
 #include "libglnx.h"
 #include "rpmostree-rojig-core.h"
 #include "rpmostree-core.h"
@@ -72,6 +70,7 @@ struct _RpmOstreeContext {
   guint n_async_pkgs_relabeled;
 
   GPtrArray *uris_to_download;
+  GPtrArray *uri_nevras;
   GUnixFDList *uri_fd_list;
 
   GHashTable *pkgs_to_remove;  /* pkgname --> gv_nevra */
@@ -85,4 +84,3 @@ struct _RpmOstreeContext {
   GHashTable *rootfs_usrlinks;
   GLnxTmpDir repo_tmpdir; /* Used to assemble+commit if no base rootfs provided */
 };
-

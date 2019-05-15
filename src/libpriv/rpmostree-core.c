@@ -361,9 +361,9 @@ rpmostree_context_finalize (GObject *object)
   g_clear_pointer (&rctx->pkgs_to_import, g_ptr_array_unref);
   g_clear_pointer (&rctx->pkgs_to_relabel, g_ptr_array_unref);
 
-  //g_clear_pointer (&rctx->uris_to_download, g_ptr_array_unref);
   g_clear_object (&rctx->uri_fd_list);
   g_clear_pointer (&rctx->uris_to_download, g_ptr_array_unref);
+  g_clear_pointer (&rctx->uri_nevras, g_ptr_array_unref);
 
   g_clear_pointer (&rctx->pkgs_to_remove, g_hash_table_unref);
   g_clear_pointer (&rctx->pkgs_to_replace, g_hash_table_unref);
@@ -482,7 +482,6 @@ rpmostree_context_ensure_tmpdir (RpmOstreeContext *self,
         return FALSE;
     }
   g_assert (self->tmpdir.initialized);
-
   if (!glnx_shutil_mkdir_p_at (self->tmpdir.fd, subdir, 0755, NULL, error))
     return FALSE;
 
@@ -1957,7 +1956,7 @@ rpmostree_context_prepare (RpmOstreeContext *self,
 
   /* And finally, handle repo packages to install */
   g_autoptr(GPtrArray) missing_pkgs = NULL;
-  self->uris_to_download = g_ptr_array_new(); //_with_free_func ((GDestroyNotify)g_free);
+  self->uris_to_download = g_ptr_array_new();
   for (char **it = pkgnames; it && *it; it++)
     {
       const char *pkgname = *it;
@@ -1968,7 +1967,7 @@ rpmostree_context_prepare (RpmOstreeContext *self,
           g_str_has_prefix (*it, "https://"))
         {
           /* Add to list of uris to download */
-          g_ptr_array_add(self->uris_to_download, (gpointer)pkgname);
+          g_ptr_array_add (self->uris_to_download, (gpointer)pkgname);
         }
       else
         {
@@ -2224,9 +2223,6 @@ rpmostree_context_download (RpmOstreeContext *self,
 
   if (u > 0)
     {
-      //g_autoptr(GUnixFDList) fd_list = g_unix_fd_list_new ();
-      //GUnixFDList* fd_list = g_unix_fd_list_new ();
-
       for (gsize i = 0; i < self->uris_to_download->len; i++)
         {
           const gchar *uri = g_ptr_array_index (self->uris_to_download, i);
@@ -2445,23 +2441,17 @@ rpmostree_context_import_rojig (RpmOstreeContext *self,
   if (!rpmostree_repo_auto_transaction_start (&txn, repo, TRUE, cancellable, error))
     return FALSE;
 
+  self->uri_nevras = g_ptr_array_new();
   for (gint i = 0; i < g_unix_fd_list_get_length (self->uri_fd_list); i++)
     {
       glnx_autofd int fd = g_unix_fd_list_get (self->uri_fd_list, i, error);
-      g_print ("importing package at fd %i\n", fd);
-      /* let's just use the current sepolicy -- we'll just relabel it if the new
-       * base turns out to have a different one */
-      glnx_autofd int rootfs_dfd = -1;
-      if (!glnx_opendirat (AT_FDCWD, "/", TRUE, &rootfs_dfd, error))
-        return FALSE;
-
-      g_autoptr(OstreeSePolicy) policy = ostree_sepolicy_new_at (rootfs_dfd, cancellable, error);
-      if (policy == NULL)
-        return FALSE;
-
-      g_autoptr(RpmOstreeImporter) unpacker = rpmostree_importer_new_take_fd (&fd, repo, NULL, 0, policy, error);
+      g_autoptr(RpmOstreeImporter) unpacker = rpmostree_importer_new_take_fd (&fd, repo, NULL, 0, self->sepolicy, error);
       if (unpacker == NULL)
         return FALSE;
+
+      // save off nevra for assemble
+      char *nevra = rpmostree_importer_get_nevra (unpacker);
+      g_ptr_array_add (self->uri_nevras, (gpointer)nevra);
 
       if (!rpmostree_importer_run (unpacker, NULL, cancellable, error))
         return FALSE;
@@ -3238,13 +3228,6 @@ relabel_if_necessary (RpmOstreeContext *self,
 
   rpmostree_output_progress_end (&progress);
 
-  // relabel downloaded packages that were installed
-  /*gboolean changed = FALSE;
-  if (!relabel_in_thread_impl (self, "cowsay", "3.04-11.fc29", "noarch", relabel_tmpdir.fd, &changed, cancellable, error))
-    {
-      g_print("failed to relabel cowsay");
-      return FALSE;
-    }*/
   /* Commit */
   if (!ostree_repo_commit_transaction (ostreerepo, NULL, cancellable, error))
     return FALSE;
@@ -3751,6 +3734,47 @@ rpmostree_context_get_kernel_changed (RpmOstreeContext *self)
   return self->kernel_changed;
 }
 
+static gboolean
+checkout_package_into_root_by_nevra (RpmOstreeContext *self,
+                                     const char       *nevra,
+                                     GCancellable     *cancellable,
+                                     GError           **error)
+{
+  OstreeRepo *pkgcache_repo = get_pkgcache_repo (self);
+
+  g_autofree char *cachebranch = NULL;
+  if (!rpmostree_nevra_to_cache_branch (nevra, &cachebranch, error))
+    return FALSE;
+
+  g_autofree char *cached_rev = NULL;
+  if (!ostree_repo_resolve_rev (pkgcache_repo, cachebranch, FALSE,
+                                &cached_rev, error))
+    return FALSE;
+
+  g_autoptr(GVariant) commit = NULL;
+  if (!ostree_repo_load_commit (pkgcache_repo, cached_rev, &commit, NULL, error))
+    return FALSE;
+
+  gboolean sepolicy_matches;
+  if (self->sepolicy)
+    {
+      if (!commit_has_matching_sepolicy (commit, self->sepolicy, &sepolicy_matches,
+                                         error))
+        return FALSE;
+
+      /* We already did any relabeling/reimporting above */
+      g_assert (sepolicy_matches);
+    }
+
+  if (!checkout_package_into_root (self, NULL,
+                                   self->tmprootfs_dfd, ".", self->devino_cache,
+                                   cached_rev, NULL,
+                                   OSTREE_REPO_CHECKOUT_OVERWRITE_UNION_IDENTICAL,
+                                   cancellable, error))
+    return FALSE;
+  return TRUE;
+}
+
 gboolean
 rpmostree_context_assemble (RpmOstreeContext      *self,
                             GCancellable          *cancellable,
@@ -3863,6 +3887,16 @@ rpmostree_context_assemble (RpmOstreeContext      *self,
         setup_package = g_object_ref (pkg);
     }
 
+  if (self->uri_nevras)
+    {
+      for (guint i = 0; i < self->uri_nevras->len; i++)
+        {
+          const char *nevra =  self->uri_nevras->pdata[i];
+          if (!checkout_package_into_root_by_nevra (self, nevra, cancellable, error))
+            return FALSE;
+        }
+    }
+
   { DECLARE_RPMSIGHANDLER_RESET;
     rpmtsOrder (ordering_ts);
   }
@@ -3893,21 +3927,9 @@ rpmostree_context_assemble (RpmOstreeContext      *self,
   const guint n_rpmts_elements = (guint)rpmtsNElements (ordering_ts);
   g_assert (n_rpmts_elements > 0);
   guint n_rpmts_done = 0;
-
   g_auto(RpmOstreeProgress) checkout_progress = { 0, };
   rpmostree_output_progress_nitems_begin (&checkout_progress, n_rpmts_elements, "%s", progress_msg);
 
-  /* Checkout downloaded packages to root */
-  if (self->uris_to_download)
-    {
-      if (!checkout_package_into_root (self, filesystem_package,
-                                       tmprootfs_dfd, ".", self->devino_cache,
-                                       g_hash_table_lookup (pkg_to_ostree_commit,
-                                                            filesystem_package), NULL,
-                                       OSTREE_REPO_CHECKOUT_OVERWRITE_UNION_IDENTICAL,
-                                       cancellable, error))
-        return FALSE;
-    }
   /* Okay so what's going on in Fedora with incestuous relationship
    * between the `filesystem`, `setup`, `libgcc` RPMs is actively
    * ridiculous.  If we unpack libgcc first it writes to /lib64 which
